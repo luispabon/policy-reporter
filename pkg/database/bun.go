@@ -14,6 +14,7 @@ import (
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
+	"github.com/uptrace/bun/driver/pgdriver"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -957,13 +958,17 @@ func (s *Store) FetchSeverityFindingCounts(ctx context.Context, filter Filter) (
 /////////////////////////
 
 func (s *Store) CreateSchemas(ctx context.Context) error {
-	if s.db.Dialect().Name() == dialect.SQLite {
-		if _, err := s.db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+	return createSchemas(ctx, s.db)
+}
+
+func createSchemas(ctx context.Context, db bun.IDB) error {
+	if db.Dialect().Name() == dialect.SQLite {
+		if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
 			return err
 		}
 	}
 
-	_, err := s.db.
+	_, err := db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*Config)(nil)).
@@ -973,7 +978,7 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.
+	_, err = db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*PolicyReport)(nil)).
@@ -983,7 +988,7 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.
+	_, err = db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*PolicyReportResult)(nil)).
@@ -994,7 +999,7 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.
+	_, err = db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*PolicyReportFilter)(nil)).
@@ -1005,7 +1010,7 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.
+	_, err = db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*ResourceResult)(nil)).
@@ -1020,52 +1025,33 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 }
 
 func (s *Store) DropSchema(ctx context.Context) error {
-	_, err := s.db.NewDropTable().
-		IfExists().
-		Model((*Config)(nil)).
-		Exec(ctx)
-	logOnError("drop policy_report_config table", err)
-	if err != nil {
-		return err
+	return dropSchema(ctx, s.db)
+}
+
+// dropSchema removes the child tables before their parent. PostgreSQL rejects
+// dropping policy_report while policy_report_resource still references it (and
+// would leave a partial schema behind), and no backend needs CASCADE here.
+func dropSchema(ctx context.Context, db bun.IDB) error {
+	drops := []struct {
+		model     any
+		operation string
+	}{
+		{(*ResourceResult)(nil), "drop policy_report_resource table"},
+		{(*PolicyReportResult)(nil), "drop policy_report_result table"},
+		{(*PolicyReportFilter)(nil), "drop policy_report_filter table"},
+		{(*PolicyReport)(nil), "drop policy_report table"},
+		{(*Config)(nil), "drop policy_report_config table"},
 	}
 
-	_, err = s.db.NewDropTable().
-		IfExists().
-		Model((*PolicyReportFilter)(nil)).
-		Exec(ctx)
-	logOnError("drop policy_report_filter table", err)
-	if err != nil {
-		return err
+	for _, drop := range drops {
+		_, err := db.NewDropTable().IfExists().Model(drop.model).Exec(ctx)
+		logOnError(drop.operation, err)
+		if err != nil {
+			return err
+		}
 	}
 
-	_, err = s.db.NewDropTable().
-		IfExists().
-		Model((*PolicyReportResult)(nil)).
-		Exec(ctx)
-	logOnError("drop policy_report_result table", err)
-	if err != nil {
-		return err
-	}
-
-	_, err = s.db.NewDropTable().
-		IfExists().
-		Model((*PolicyReport)(nil)).
-		Exec(ctx)
-	logOnError("drop policy_report table", err)
-	if err != nil {
-		return err
-	}
-
-	_, err = s.db.NewDropTable().
-		IfExists().
-		Model((*ResourceResult)(nil)).
-		Exec(ctx)
-	logOnError("drop policy_report_resource table", err)
-	if err != nil {
-		return err
-	}
-
-	return err
+	return nil
 }
 
 func (s *Store) Add(ctx context.Context, report openreports.ReportInterface) error {
@@ -1144,13 +1130,17 @@ func remove(ctx context.Context, db bun.IDB, id string) error {
 const postgresCleanUpQuery = "TRUNCATE TABLE ONLY policy_report, ONLY policy_report_resource, ONLY policy_report_result, ONLY policy_report_filter RESTRICT"
 
 func (s *Store) CleanUp(ctx context.Context) error {
+	return cleanUp(ctx, s.db)
+}
+
+func cleanUp(ctx context.Context, db bun.IDB) error {
 	operation := "DELETE"
 	var err error
-	if s.db.Dialect().Name() == dialect.PG {
+	if db.Dialect().Name() == dialect.PG {
 		operation = "TRUNCATE"
-		_, err = s.db.ExecContext(ctx, postgresCleanUpQuery)
+		_, err = db.ExecContext(ctx, postgresCleanUpQuery)
 	} else {
-		_, err = s.db.NewDelete().Model((*PolicyReport)(nil)).Where("id is not null").Exec(ctx)
+		_, err = db.NewDelete().Model((*PolicyReport)(nil)).Where("id is not null").Exec(ctx)
 	}
 	if err != nil {
 		zap.L().Error("failed to remove policy reports", zap.Error(err))
@@ -1249,23 +1239,35 @@ func (s *Store) RequireSchemaUpgrade(ctx context.Context) bool {
 		return true
 	}
 
-	config := Config{}
-
-	err := s.db.NewSelect().Model(&config).Where("id = ?", 1).Scan(ctx)
+	upgrade, err := requireSchemaUpgrade(ctx, s.db, s.version)
 	if err != nil {
 		zap.L().Debug("failed to load config", zap.Error(err))
 		return true
 	}
 
-	return config.Version != s.version
+	return upgrade
+}
+
+func requireSchemaUpgrade(ctx context.Context, db bun.IDB, version string) (bool, error) {
+	config := Config{}
+
+	if err := db.NewSelect().Model(&config).Where("id = ?", 1).Scan(ctx); err != nil {
+		return false, err
+	}
+
+	return config.Version != version, nil
 }
 
 func (s *Store) PersistSchemaVersion(ctx context.Context) error {
+	return persistSchemaVersion(ctx, s.db, s.version)
+}
+
+func persistSchemaVersion(ctx context.Context, db bun.IDB, version string) error {
 	config := Config{
-		Version: s.version,
+		Version: version,
 	}
 
-	_, err := s.db.NewInsert().Model(&config).Exec(ctx)
+	_, err := db.NewInsert().Model(&config).Exec(ctx)
 	if err != nil {
 		zap.L().Error("failed to persist database version", zap.Error(err))
 		return err
@@ -1276,6 +1278,11 @@ func (s *Store) PersistSchemaVersion(ctx context.Context) error {
 
 func (s *Store) PrepareDatabase(ctx context.Context) error {
 	zap.L().Debug("preparing database")
+
+	if s.db.Dialect().Name() == dialect.PG {
+		return s.preparePostgresDatabase(ctx)
+	}
+
 	if s.RequireSchemaUpgrade(ctx) {
 		zap.L().Debug("database schema upgrade started")
 		if err := s.DropSchema(ctx); err != nil {
@@ -1292,6 +1299,272 @@ func (s *Store) PrepareDatabase(ctx context.Context) error {
 	}
 
 	return s.CleanUp(ctx)
+}
+
+const (
+	// postgresPrepareLockClass scopes the advisory lock to database preparation.
+	postgresPrepareLockClass int64 = 0x70523031 // "pR01"
+)
+
+var postgresTargetTables = []string{
+	"policy_report_config",
+	"policy_report",
+	"policy_report_resource",
+	"policy_report_result",
+	"policy_report_filter",
+}
+
+// postgresPrepareLockKey packs the schema namespace OID and a purpose constant
+// into one bigint advisory lock key. OIDs are uint32, so shifting them into the
+// high bits keeps the key positive and unique per schema.
+func postgresPrepareLockKey(namespaceOID int64) int64 {
+	return namespaceOID<<31 | postgresPrepareLockClass
+}
+
+// preparePostgresDatabase prepares the schema in one read committed transaction.
+// The transaction-scoped advisory lock serializes cooperating preparers of the
+// same schema, the search path guard fails closed before any destructive
+// statement, and a failure rolls the whole preparation back so no partial
+// schema is left behind. The lock cannot coordinate older binaries that do not
+// take it, and it does not stop other instances from clearing their caches.
+func (s *Store) preparePostgresDatabase(ctx context.Context) error {
+	return s.db.RunInTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted}, func(ctx context.Context, tx bun.Tx) error {
+		if err := lockPostgresPrepare(ctx, tx); err != nil {
+			return err
+		}
+
+		rebuild, err := postgresSchemaUpgradeRequired(ctx, tx, s.version)
+		if err != nil {
+			return err
+		}
+
+		if rebuild {
+			zap.L().Debug("database schema upgrade started")
+			if err := dropSchema(ctx, tx); err != nil {
+				return err
+			}
+
+			if err := createSchemas(ctx, tx); err != nil {
+				return err
+			}
+
+			if err := persistSchemaVersion(ctx, tx, s.version); err != nil {
+				return err
+			}
+		}
+
+		// TRUNCATE keeps an exclusive lock on the cache tables until commit, so
+		// the index build below cannot race writers and a failure rolls the
+		// truncate back.
+		if err := cleanUp(ctx, tx); err != nil {
+			return err
+		}
+
+		if err := ensurePostgresIndexes(ctx, tx); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func lockPostgresPrepare(ctx context.Context, db bun.IDB) error {
+	var schema sql.NullString
+	var namespaceOID sql.NullInt64
+	if err := db.QueryRowContext(ctx, "SELECT current_schema(), (SELECT oid FROM pg_namespace WHERE nspname = current_schema())").Scan(&schema, &namespaceOID); err != nil {
+		return fmt.Errorf("resolve current schema: %w", err)
+	}
+	if !schema.Valid || schema.String == "" {
+		return errors.New("resolve current schema: search_path resolves to no schema")
+	}
+	if !namespaceOID.Valid {
+		return fmt.Errorf("resolve current schema: schema %q has no namespace oid", schema.String)
+	}
+
+	if _, err := db.ExecContext(ctx, "SELECT pg_advisory_xact_lock(?)", postgresPrepareLockKey(namespaceOID.Int64)); err != nil {
+		return fmt.Errorf("lock database schema %q: %w", schema.String, err)
+	}
+
+	return guardPostgresSchema(ctx, db, schema.String, namespaceOID.Int64)
+}
+
+const postgresSchemaGuardQuery = `SELECT current_schema(),
+	pg_my_temp_schema()::bigint,
+	(SELECT oid FROM pg_namespace WHERE nspname = current_schema())`
+
+// guardPostgresSchema rejects a session whose search_path could resolve the
+// cache tables outside the schema locked by the transaction. A multi-schema
+// path is fine as long as every existing cache table still resolves to the
+// locked schema.
+func guardPostgresSchema(ctx context.Context, db bun.IDB, schema string, namespaceOID int64) error {
+	var current sql.NullString
+	var tempNamespace int64
+	var currentNamespace sql.NullInt64
+	if err := db.QueryRowContext(ctx, postgresSchemaGuardQuery).Scan(&current, &tempNamespace, &currentNamespace); err != nil {
+		return fmt.Errorf("inspect search_path: %w", err)
+	}
+	if tempNamespace != 0 {
+		return fmt.Errorf("search_path uses temporary schema %d, which is searched before %q", tempNamespace, schema)
+	}
+	if !current.Valid || current.String != schema {
+		return fmt.Errorf("current schema changed from %q to %q while acquiring the prepare lock", schema, current.String)
+	}
+	if !currentNamespace.Valid || currentNamespace.Int64 != namespaceOID {
+		return fmt.Errorf("database schema %q changed while acquiring the prepare lock", schema)
+	}
+
+	for _, table := range postgresTargetTables {
+		var resolved string
+		err := db.QueryRowContext(ctx, "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass(?)", table).Scan(&resolved)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("resolve table %q: %w", table, err)
+		}
+		if resolved != schema {
+			return fmt.Errorf("table %q resolves to schema %q outside current schema %q", table, resolved, schema)
+		}
+	}
+
+	return nil
+}
+
+// postgresSchemaUpgradeRequired reports whether the schema must be rebuilt. A
+// missing config table or missing version row means a fresh or incomplete
+// schema, while any other read error aborts the preparation.
+func postgresSchemaUpgradeRequired(ctx context.Context, db bun.IDB, version string) (bool, error) {
+	var exists bool
+	if err := db.QueryRowContext(ctx, "SELECT to_regclass('policy_report_config') IS NOT NULL").Scan(&exists); err != nil {
+		return false, fmt.Errorf("check config table: %w", err)
+	}
+	if !exists {
+		return true, nil
+	}
+
+	var persisted string
+	err := db.QueryRowContext(ctx, "SELECT version FROM policy_report_config WHERE id = 1").Scan(&persisted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read config version: %w", err)
+	}
+
+	return persisted != version, nil
+}
+
+type postgresChildIndex struct {
+	table string
+	name  string
+}
+
+var postgresChildIndexes = []postgresChildIndex{
+	{table: "policy_report_resource", name: "policy_report_resource_policy_report_id_idx"},
+	{table: "policy_report_result", name: "policy_report_result_policy_report_id_idx"},
+	{table: "policy_report_filter", name: "policy_report_filter_policy_report_id_idx"},
+}
+
+// postgresSuitableIndexQuery finds an existing index that a default lookup by
+// policy_report_id can use: a live, valid, ready, non-partial btree whose first
+// key column is policy_report_id with the default operator class and the
+// column's collation. Trailing key columns or expressions are allowed.
+const postgresSuitableIndexQuery = `SELECT c.relname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_class t ON t.oid = i.indrelid
+JOIN pg_namespace n ON n.oid = t.relnamespace
+JOIN pg_attribute a ON a.attrelid = t.oid AND a.attname = 'policy_report_id'
+JOIN pg_am am ON am.oid = c.relam
+JOIN pg_opclass opc ON opc.oid = i.indclass[0]
+WHERE n.nspname = current_schema()
+	AND t.relname = ?
+	AND i.indisvalid
+	AND i.indisready
+	AND i.indislive
+	AND i.indpred IS NULL
+	AND am.amname = 'btree'
+	AND i.indkey[0] = a.attnum
+	AND i.indcollation[0] = a.attcollation
+	AND opc.opcmethod = am.oid
+	AND opc.opcdefault
+	AND (opc.opcintype = a.atttypid OR EXISTS (
+		SELECT 1
+		FROM pg_cast ct
+		WHERE ct.castsource = a.atttypid
+			AND ct.casttarget = opc.opcintype
+			AND ct.castmethod = 'b'
+	))
+ORDER BY c.relname`
+
+func ensurePostgresIndexes(ctx context.Context, db bun.IDB) error {
+	for _, index := range postgresChildIndexes {
+		if err := ensurePostgresIndex(ctx, db, index); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ensurePostgresIndex reuses a suitable index under any name. When the expected
+// name is taken by an incompatible relation it fails instead of silently
+// skipping (IF NOT EXISTS) or dropping an operator-created index.
+func ensurePostgresIndex(ctx context.Context, db bun.IDB, index postgresChildIndex) error {
+	suitable, err := postgresSuitableIndexNames(ctx, db, index.table)
+	if err != nil {
+		return err
+	}
+	if len(suitable) > 0 {
+		return nil
+	}
+
+	var relkind string
+	err = db.QueryRowContext(ctx, "SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relname = ?", index.name).Scan(&relkind)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect relation name %q: %w", index.name, err)
+	}
+	if err == nil {
+		if relkind == "i" {
+			return fmt.Errorf("index %q exists but is not a usable btree index leading with policy_report_id", index.name)
+		}
+
+		return fmt.Errorf("relation name %q is already used by a %q relation", index.name, relkind)
+	}
+
+	if _, err := db.NewCreateIndex().Index(index.name).Table(index.table).Column("policy_report_id").Exec(ctx); err != nil {
+		return wrapPostgresIndexError(index, err)
+	}
+
+	return nil
+}
+
+func wrapPostgresIndexError(index postgresChildIndex, err error) error {
+	var pgErr pgdriver.Error
+	if errors.As(err, &pgErr) && pgErr.Field('C') == "42501" {
+		return fmt.Errorf("create index %q on %s: PostgreSQL requires ownership of the table to create the index automatically: %w", index.name, index.table, err)
+	}
+
+	return fmt.Errorf("create index %q on %s: %w", index.name, index.table, err)
+}
+
+func postgresSuitableIndexNames(ctx context.Context, db bun.IDB, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, postgresSuitableIndexQuery, table)
+	if err != nil {
+		return nil, fmt.Errorf("inspect indexes on %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	names := make([]string, 0, 1)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("inspect indexes on %s: %w", table, err)
+		}
+		names = append(names, name)
+	}
+
+	return names, rows.Err()
 }
 
 func NewStore(db *bun.DB, version string) (*Store, error) {
