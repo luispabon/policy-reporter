@@ -957,13 +957,17 @@ func (s *Store) FetchSeverityFindingCounts(ctx context.Context, filter Filter) (
 /////////////////////////
 
 func (s *Store) CreateSchemas(ctx context.Context) error {
-	if s.db.Dialect().Name() == dialect.SQLite {
-		if _, err := s.db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+	return createSchemas(ctx, s.db)
+}
+
+func createSchemas(ctx context.Context, db bun.IDB) error {
+	if db.Dialect().Name() == dialect.SQLite {
+		if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
 			return err
 		}
 	}
 
-	_, err := s.db.
+	_, err := db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*Config)(nil)).
@@ -973,7 +977,7 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.
+	_, err = db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*PolicyReport)(nil)).
@@ -983,7 +987,7 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.
+	_, err = db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*PolicyReportResult)(nil)).
@@ -994,7 +998,7 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.
+	_, err = db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*PolicyReportFilter)(nil)).
@@ -1005,7 +1009,7 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.
+	_, err = db.
 		NewCreateTable().
 		IfNotExists().
 		Model((*ResourceResult)(nil)).
@@ -1020,16 +1024,13 @@ func (s *Store) CreateSchemas(ctx context.Context) error {
 }
 
 func (s *Store) DropSchema(ctx context.Context) error {
-	_, err := s.db.NewDropTable().
-		IfExists().
-		Model((*Config)(nil)).
-		Exec(ctx)
-	logOnError("drop policy_report_config table", err)
-	if err != nil {
-		return err
-	}
+	return dropSchema(ctx, s.db)
+}
 
-	_, err = s.db.NewDropTable().
+// dropSchema drops the child tables before their parent: PostgreSQL rejects
+// dropping policy_report while policy_report_resource still references it.
+func dropSchema(ctx context.Context, db bun.IDB) error {
+	_, err := db.NewDropTable().
 		IfExists().
 		Model((*PolicyReportFilter)(nil)).
 		Exec(ctx)
@@ -1038,7 +1039,7 @@ func (s *Store) DropSchema(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.NewDropTable().
+	_, err = db.NewDropTable().
 		IfExists().
 		Model((*PolicyReportResult)(nil)).
 		Exec(ctx)
@@ -1047,7 +1048,16 @@ func (s *Store) DropSchema(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.NewDropTable().
+	_, err = db.NewDropTable().
+		IfExists().
+		Model((*ResourceResult)(nil)).
+		Exec(ctx)
+	logOnError("drop policy_report_resource table", err)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.NewDropTable().
 		IfExists().
 		Model((*PolicyReport)(nil)).
 		Exec(ctx)
@@ -1056,11 +1066,11 @@ func (s *Store) DropSchema(ctx context.Context) error {
 		return err
 	}
 
-	_, err = s.db.NewDropTable().
+	_, err = db.NewDropTable().
 		IfExists().
-		Model((*ResourceResult)(nil)).
+		Model((*Config)(nil)).
 		Exec(ctx)
-	logOnError("drop policy_report_resource table", err)
+	logOnError("drop policy_report_config table", err)
 	if err != nil {
 		return err
 	}
@@ -1140,7 +1150,11 @@ func remove(ctx context.Context, db bun.IDB, id string) error {
 }
 
 func (s *Store) CleanUp(ctx context.Context) error {
-	_, err := s.db.NewDelete().Model((*PolicyReport)(nil)).Where("id is not null").Exec(ctx)
+	return cleanUp(ctx, s.db)
+}
+
+func cleanUp(ctx context.Context, db bun.IDB) error {
+	_, err := db.NewDelete().Model((*PolicyReport)(nil)).Where("id is not null").Exec(ctx)
 	if err != nil {
 		zap.L().Error("failed to remove policy reports", zap.Error(err))
 		errorMetric.With(prometheus.Labels{"operation": "DELETE", "table": "policy_report", "reason": mapReason(err)}).Inc()
@@ -1250,11 +1264,15 @@ func (s *Store) RequireSchemaUpgrade(ctx context.Context) bool {
 }
 
 func (s *Store) PersistSchemaVersion(ctx context.Context) error {
+	return persistSchemaVersion(ctx, s.db, s.version)
+}
+
+func persistSchemaVersion(ctx context.Context, db bun.IDB, version string) error {
 	config := Config{
-		Version: s.version,
+		Version: version,
 	}
 
-	_, err := s.db.NewInsert().Model(&config).Exec(ctx)
+	_, err := db.NewInsert().Model(&config).Exec(ctx)
 	if err != nil {
 		zap.L().Error("failed to persist database version", zap.Error(err))
 		return err
@@ -1265,6 +1283,10 @@ func (s *Store) PersistSchemaVersion(ctx context.Context) error {
 
 func (s *Store) PrepareDatabase(ctx context.Context) error {
 	zap.L().Debug("preparing database")
+	if s.db.Dialect().Name() == dialect.PG {
+		return s.preparePostgres(ctx)
+	}
+
 	if s.RequireSchemaUpgrade(ctx) {
 		zap.L().Debug("database schema upgrade started")
 		if err := s.DropSchema(ctx); err != nil {
@@ -1282,6 +1304,163 @@ func (s *Store) PrepareDatabase(ctx context.Context) error {
 
 	return s.CleanUp(ctx)
 }
+
+// prepareLockKey is the advisory lock taken while preparing PostgreSQL. Advisory
+// locks are scoped to the current database, so instances using the same database
+// serialize even across schemas; older binaries do not take the lock. See
+// docs/POSTGRES_INDEXES.md.
+const prepareLockKey int64 = 0x706f6c696379 // "policy"
+
+// policyReportIndexTables are the child tables whose cascade deletes need an
+// index on policy_report_id; the foreign keys themselves do not create one.
+var policyReportIndexTables = []string{"policy_report_filter", "policy_report_result", "policy_report_resource"}
+
+// postgresTargetRelations are the tables the lifecycle creates, drops and
+// deletes with unqualified statements.
+var postgresTargetRelations = []string{
+	"policy_report_config", "policy_report", "policy_report_result", "policy_report_filter", "policy_report_resource",
+}
+
+// guardPostgresSchema fails closed before any DDL or delete: unqualified
+// statements follow search_path, so every existing target table must resolve
+// into current_schema() and no temporary schema may shadow it.
+func guardPostgresSchema(ctx context.Context, db bun.IDB) error {
+	var tempSchema int64
+	var current sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT pg_my_temp_schema()::bigint, current_schema()").Scan(&tempSchema, &current); err != nil {
+		return fmt.Errorf("inspect search_path: %w", err)
+	}
+	if !current.Valid || current.String == "" {
+		return errors.New("search_path resolves to no current schema")
+	}
+	if tempSchema != 0 {
+		return errors.New("search_path includes a temporary schema")
+	}
+
+	for _, relation := range postgresTargetRelations {
+		var resolved string
+		err := db.QueryRowContext(ctx, "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass(?)", relation).Scan(&resolved)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("resolve %s through search_path: %w", relation, err)
+		}
+		if resolved != current.String {
+			return fmt.Errorf("search_path resolves %s to schema %q instead of %q", relation, resolved, current.String)
+		}
+	}
+
+	return nil
+}
+
+// preparePostgres prepares PostgreSQL in one READ COMMITTED transaction: rebuild,
+// indexes and cleanup either all commit or leave the previous schema and reports
+// untouched. READ COMMITTED is explicit so a repeatable read server default
+// cannot hide a version committed while waiting for the lock.
+func (s *Store) preparePostgres(ctx context.Context) error {
+	return s.db.RunInTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted}, func(ctx context.Context, tx bun.Tx) error {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(?)", prepareLockKey); err != nil {
+			return fmt.Errorf("lock database preparation: %w", err)
+		}
+
+		if err := guardPostgresSchema(ctx, tx); err != nil {
+			return err
+		}
+
+		upgrade, err := requiresSchemaUpgrade(ctx, tx, s.version)
+		if err != nil {
+			return err
+		}
+
+		if upgrade {
+			zap.L().Debug("database schema upgrade started")
+			if err := dropSchema(ctx, tx); err != nil {
+				return err
+			}
+
+			if err := createSchemas(ctx, tx); err != nil {
+				return err
+			}
+
+			if err := persistSchemaVersion(ctx, tx, s.version); err != nil {
+				return err
+			}
+		}
+
+		// Create indexes before the cleanup delete, which needs them most.
+		if err := ensurePolicyReportIndexes(ctx, tx); err != nil {
+			return err
+		}
+
+		return cleanUp(ctx, tx)
+	})
+}
+
+// requiresSchemaUpgrade reports whether the schema must be rebuilt. A missing
+// config table or version row is a fresh or incomplete database; any other read
+// failure aborts preparation so a transient error cannot drop stored reports.
+func requiresSchemaUpgrade(ctx context.Context, db bun.IDB, version string) (bool, error) {
+	var exists bool
+	if err := db.NewRaw("SELECT to_regclass('policy_report_config') IS NOT NULL").Scan(ctx, &exists); err != nil {
+		return false, fmt.Errorf("check policy_report_config table: %w", err)
+	}
+	if !exists {
+		return true, nil
+	}
+
+	config := Config{}
+	err := db.NewSelect().Model(&config).Where("id = ?", 1).Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read schema version: %w", err)
+	}
+
+	return config.Version != version, nil
+}
+
+// ensurePolicyReportIndexes reuses a usable index or creates the reserved one,
+// before the cleanup delete that needs it. Existing indexes are never dropped.
+// Large installations should prebuild the index: see docs/POSTGRES_INDEXES.md.
+func ensurePolicyReportIndexes(ctx context.Context, db bun.IDB) error {
+	for _, table := range policyReportIndexTables {
+		var usable bool
+		if err := db.NewRaw(policyReportIndexQuery, table).Scan(ctx, &usable); err != nil {
+			return fmt.Errorf("inspect indexes on %s: %w", table, err)
+		}
+		if usable {
+			continue
+		}
+
+		name := table + "_policy_report_id_idx"
+		if _, err := db.NewCreateIndex().Index(name).Table(table).Column("policy_report_id").Exec(ctx); err != nil {
+			return fmt.Errorf("create index %s on %s: %w (see docs/POSTGRES_INDEXES.md)", name, table, err)
+		}
+	}
+
+	return nil
+}
+
+// policyReportIndexQuery reports whether the table already has an index usable
+// for policy_report_id lookups and cascade deletes.
+const policyReportIndexQuery = `
+SELECT EXISTS (
+	SELECT 1
+	FROM pg_index i
+	JOIN pg_class ic ON ic.oid = i.indexrelid
+	JOIN pg_am am ON am.oid = ic.relam
+	JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+	WHERE i.indrelid = ?::regclass
+		AND i.indisvalid
+		AND i.indisready
+		AND i.indislive
+		AND i.indpred IS NULL
+		AND am.amname = 'btree'
+		AND a.attname = 'policy_report_id'
+		AND i.indcollation[0] = a.attcollation
+)`
 
 func NewStore(db *bun.DB, version string) (*Store, error) {
 	if db == nil {
